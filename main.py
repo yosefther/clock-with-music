@@ -14,7 +14,10 @@ Run:
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
 import uuid
 from dataclasses import asdict, dataclass
@@ -58,6 +61,7 @@ except Exception:
 
 VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
 PARTIAL_CACHE_SUFFIXES = (".part", ".ytdl", ".tmp", ".temp")
+EXE_BASE_NAME = "TimerDashboard"
 
 
 def format_hms(total_seconds: int) -> str:
@@ -1132,6 +1136,73 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+def maybe_rebuild_executable() -> None:
+    # Skip build when running from a packaged executable.
+    if getattr(sys, "frozen", False):
+        return
+
+    if "--skip-build" in sys.argv:
+        sys.argv[:] = [arg for arg in sys.argv if arg != "--skip-build"]
+        return
+
+    try:
+        import PyInstaller.__main__  # type: ignore # noqa: F401
+    except Exception:
+        print("PyInstaller is not installed. Run: uv add pyinstaller")
+        return
+
+    base_dir = Path(__file__).resolve().parent
+    script_path = base_dir / "main.py"
+    dist_dir = base_dir / "dist"
+    build_dir = base_dir / "build"
+    spec_path = base_dir / f"{EXE_BASE_NAME}.spec"
+    exe_name = f"{EXE_BASE_NAME}.exe" if os.name == "nt" else EXE_BASE_NAME
+    exe_path = dist_dir / exe_name
+
+    dist_dir.mkdir(parents=True, exist_ok=True)
+
+    if exe_path.exists():
+        try:
+            exe_path.unlink()
+            print(f"Removed old executable: {exe_path}")
+        except Exception as exc:
+            print(f"Could not remove old executable ({exe_path}): {exc}")
+            return
+
+    if build_dir.exists():
+        shutil.rmtree(build_dir, ignore_errors=True)
+    if spec_path.exists():
+        try:
+            spec_path.unlink()
+        except Exception:
+            pass
+
+    command = [
+        sys.executable,
+        "-m",
+        "PyInstaller",
+        "--noconfirm",
+        "--windowed",
+        "--onefile",
+        "--name",
+        EXE_BASE_NAME,
+        "--distpath",
+        str(dist_dir),
+        "--workpath",
+        str(build_dir),
+        "--specpath",
+        str(base_dir),
+        str(script_path),
+    ]
+
+    print("Building executable...")
+    result = subprocess.run(command, cwd=str(base_dir), check=False)
+    if result.returncode == 0:
+        print(f"Built executable: {exe_path}")
+    else:
+        print("Executable build failed.")
+
+
 def main() -> int:
     app = QApplication(sys.argv)
     window = MainWindow()
@@ -1140,4 +1211,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    maybe_rebuild_executable()
     raise SystemExit(main())
