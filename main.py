@@ -1,12 +1,11 @@
-﻿"""
-Timer Dashboard (no canvas)
+﻿
+"""
+Timer Dashboard + YouTube Audio
 
-A normal timer app styled like a card grid:
-- multiple timer cards
-- each card has countdown ring, start/pause, reset
-- editable duration per card
-- add/remove timers
-- layout/state persistence to layout.json
+- Timer cards in a normal grid layout
+- YouTube audio panel with queue (add/remove/reorder/next/prev)
+- Audio cached in ./cache via yt-dlp
+- Timer layout persisted in layout.json
 
 Run:
     uv run python main.py
@@ -15,12 +14,15 @@ Run:
 from __future__ import annotations
 
 import json
+import re
+import sys
 import uuid
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
-from PySide6.QtCore import QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
@@ -29,14 +31,33 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSlider,
     QSpinBox,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
+
+try:
+    import yt_dlp  # type: ignore
+except Exception:
+    yt_dlp = None
+
+try:
+    from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+except Exception:
+    QAudioOutput = None
+    QMediaPlayer = None
+
+
+VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
+PARTIAL_CACHE_SUFFIXES = (".part", ".ytdl", ".tmp", ".temp")
 
 
 def format_hms(total_seconds: int) -> str:
@@ -46,6 +67,104 @@ def format_hms(total_seconds: int) -> str:
     return f"{hours:02}:{minutes:02}:{seconds:02}"
 
 
+def format_duration_short(seconds: int | None) -> str:
+    if not seconds:
+        return "00:00"
+    total = int(seconds)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours:02}:{minutes:02}:{secs:02}"
+    return f"{minutes:02}:{secs:02}"
+
+
+def extract_video_id(url: str) -> str | None:
+    try:
+        parsed = urlparse(url.strip())
+    except Exception:
+        return None
+
+    host = (parsed.netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+
+    video_id = None
+    if host == "youtu.be":
+        segment = parsed.path.strip("/").split("/", 1)[0]
+        video_id = segment or None
+    elif host in {"youtube.com", "m.youtube.com", "music.youtube.com"}:
+        path_parts = [p for p in parsed.path.split("/") if p]
+        if parsed.path == "/watch":
+            query = parse_qs(parsed.query)
+            video_id = (query.get("v") or [None])[0]
+        elif path_parts and path_parts[0] in {"shorts", "embed", "live"} and len(path_parts) > 1:
+            video_id = path_parts[1]
+
+    if video_id and VIDEO_ID_PATTERN.match(video_id):
+        return video_id
+    return None
+
+
+def is_valid_youtube_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url.strip())
+    except Exception:
+        return False
+
+    if parsed.scheme not in {"http", "https"}:
+        return False
+
+    host = (parsed.netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+
+    if host not in {"youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}:
+        return False
+
+    return extract_video_id(url) is not None
+
+
+def canonical_watch_url(url: str) -> str:
+    video_id = extract_video_id(url)
+    if video_id:
+        return f"https://www.youtube.com/watch?v={video_id}"
+    return url.strip()
+
+
+def find_cached_audio(cache_dir: Path, video_id: str) -> Path | None:
+    for path in sorted(cache_dir.glob(f"{video_id}.*")):
+        if not path.is_file():
+            continue
+        if path.name.lower().endswith(PARTIAL_CACHE_SUFFIXES):
+            continue
+        return path.resolve()
+    return None
+
+
+def cleanup_partial_cache_files(cache_dir: Path, video_id: str) -> None:
+    for path in cache_dir.glob(f"{video_id}.*"):
+        if not path.is_file():
+            continue
+        if not path.name.lower().endswith(PARTIAL_CACHE_SUFFIXES):
+            continue
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def cleanup_all_partial_cache_files(cache_dir: Path) -> None:
+    for path in cache_dir.iterdir():
+        if not path.is_file():
+            continue
+        if not path.name.lower().endswith(PARTIAL_CACHE_SUFFIXES):
+            continue
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 @dataclass
 class TimerSnapshot:
     timer_id: str
@@ -53,6 +172,19 @@ class TimerSnapshot:
     total_seconds: int
     remaining_seconds: int
     is_running: bool
+
+
+@dataclass
+class QueueEntry:
+    queue_id: str
+    url: str
+    title: str
+    duration: int
+    video_id: str
+    file_path: str
+
+    def display_text(self) -> str:
+        return f"{self.title}  [{format_duration_short(self.duration)}]"
 
 
 class RingTimeDisplay(QWidget):
@@ -76,14 +208,12 @@ class RingTimeDisplay(QWidget):
         padding = 14
         rect = self.rect().adjusted(padding, padding, -padding, -padding)
 
-        # Track ring
         track_pen = QPen(QColor("#3b3d45"), 12)
         track_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(track_pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawEllipse(rect)
 
-        # Progress ring
         if self._progress > 0.0:
             progress_pen = QPen(QColor("#f27f62"), 12)
             progress_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
@@ -92,7 +222,6 @@ class RingTimeDisplay(QWidget):
             span_angle = -int(self._progress * 360 * 16)
             painter.drawArc(rect, start_angle, span_angle)
 
-        # Time text
         painter.setPen(QColor("#d6d7db"))
         font = painter.font()
         font.setPointSize(20)
@@ -128,7 +257,7 @@ class TimerCard(QFrame):
         top.addWidget(self.title_label)
         top.addStretch(1)
 
-        self.delete_button = QPushButton("✕")
+        self.delete_button = QPushButton("X")
         self.delete_button.setFixedSize(26, 26)
         self.delete_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.delete_button.setToolTip("Delete timer")
@@ -142,14 +271,14 @@ class TimerCard(QFrame):
         controls = QHBoxLayout()
         controls.addStretch(1)
 
-        self.play_pause_button = QPushButton("▶")
-        self.play_pause_button.setFixedSize(36, 36)
+        self.play_pause_button = QPushButton("Play")
+        self.play_pause_button.setFixedHeight(34)
         self.play_pause_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.play_pause_button.clicked.connect(self.toggle_start_pause)
         controls.addWidget(self.play_pause_button)
 
-        self.reset_button = QPushButton("↻")
-        self.reset_button.setFixedSize(32, 32)
+        self.reset_button = QPushButton("Reset")
+        self.reset_button.setFixedHeight(34)
         self.reset_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.reset_button.clicked.connect(self.reset_timer)
         controls.addWidget(self.reset_button)
@@ -199,13 +328,10 @@ class TimerCard(QFrame):
             self.timer.start()
         else:
             self.timer.stop()
-        self.play_pause_button.setText("⏸" if self.is_running else "▶")
+        self.play_pause_button.setText("Pause" if self.is_running else "Play")
 
     def update_visual_state(self) -> None:
-        if self.total_seconds <= 0:
-            progress = 0.0
-        else:
-            progress = 1.0 - (self.remaining_seconds / self.total_seconds)
+        progress = 1.0 - (self.remaining_seconds / self.total_seconds) if self.total_seconds > 0 else 0.0
         self.ring.set_state(format_hms(self.remaining_seconds), progress)
 
     def apply_new_duration(self) -> None:
@@ -258,34 +384,148 @@ class TimerCard(QFrame):
         )
 
 
+class YtDownloadWorker(QObject):
+    progress = Signal(str)
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(self, url: str, cache_dir: Path) -> None:
+        super().__init__()
+        self.url = url
+        self.cache_dir = cache_dir
+
+    def run(self) -> None:
+        if yt_dlp is None:
+            self.error.emit("yt-dlp is not installed. Install with: uv add yt-dlp")
+            return
+
+        try:
+            canonical_url = canonical_watch_url(self.url)
+            video_id = extract_video_id(canonical_url)
+            if not video_id:
+                self.error.emit("Invalid YouTube URL.")
+                return
+
+            self.progress.emit("Fetching metadata...")
+            info_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "skip_download": True,
+            }
+            with yt_dlp.YoutubeDL(info_opts) as ydl:
+                info = ydl.extract_info(canonical_url, download=False)
+
+            if not isinstance(info, dict):
+                self.error.emit("Failed to read video metadata.")
+                return
+
+            title = str(info.get("title") or "Untitled")
+            duration = int(info.get("duration") or 0)
+            video_id = str(info.get("id") or video_id)
+
+            cleanup_partial_cache_files(self.cache_dir, video_id)
+            cached = find_cached_audio(self.cache_dir, video_id)
+            if cached:
+                entry = QueueEntry(
+                    queue_id=uuid.uuid4().hex,
+                    url=canonical_url,
+                    title=title,
+                    duration=duration,
+                    video_id=video_id,
+                    file_path=str(cached),
+                )
+                self.finished.emit(entry)
+                return
+
+            self.progress.emit("Downloading audio...")
+            outtmpl = str(self.cache_dir / f"{video_id}.%(ext)s")
+            dl_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "format": "bestaudio/best",
+                "outtmpl": outtmpl,
+                "nopart": True,
+                "retries": 3,
+            }
+            with yt_dlp.YoutubeDL(dl_opts) as ydl:
+                downloaded_info = ydl.extract_info(canonical_url, download=True)
+                downloaded_path = Path(ydl.prepare_filename(downloaded_info)).resolve()
+
+            if not downloaded_path.exists():
+                fallback = find_cached_audio(self.cache_dir, video_id)
+                if fallback:
+                    downloaded_path = fallback
+                else:
+                    self.error.emit("Download finished but no audio file found in cache.")
+                    return
+
+            entry = QueueEntry(
+                queue_id=uuid.uuid4().hex,
+                url=canonical_url,
+                title=title,
+                duration=duration,
+                video_id=video_id,
+                file_path=str(downloaded_path),
+            )
+            self.finished.emit(entry)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Timer Dashboard")
-        self.resize(1320, 860)
+        self.setWindowTitle("Timer Dashboard + YouTube Audio")
+        self.resize(1420, 900)
 
         self.base_dir = Path(__file__).resolve().parent
         self.layout_path = self.base_dir / "layout.json"
+        self.cache_dir = self.base_dir / "cache"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        cleanup_all_partial_cache_files(self.cache_dir)
 
         self.cards: dict[str, TimerCard] = {}
         self.card_order: list[str] = []
+
+        self.active_workers: list[YtDownloadWorker] = []
+        self.active_threads: list[QThread] = []
+
+        self.media_player: QMediaPlayer | None = None
+        self.audio_output: QAudioOutput | None = None
+        self.current_queue_id: str | None = None
+        self.is_user_seeking = False
 
         self.save_timer = QTimer(self)
         self.save_timer.setInterval(250)
         self.save_timer.setSingleShot(True)
         self.save_timer.timeout.connect(self.save_layout)
 
+        self.playback_timer = QTimer(self)
+        self.playback_timer.setInterval(500)
+        self.playback_timer.timeout.connect(self.update_playback_progress)
+        self.playback_timer.start()
+
         self._build_ui()
+        self._init_audio_player()
         self.load_layout()
 
     def _build_ui(self) -> None:
         root = QWidget()
-        root_layout = QVBoxLayout(root)
+        root_layout = QHBoxLayout(root)
         root_layout.setContentsMargins(14, 14, 14, 14)
         root_layout.setSpacing(10)
 
-        top = QHBoxLayout()
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        root_layout.addWidget(splitter)
 
+        # Left side: timer dashboard
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(10)
+
+        top = QHBoxLayout()
         self.add_1m = QPushButton("1 min")
         self.add_1m.clicked.connect(lambda: self.add_timer_card("1 min", 60))
         top.addWidget(self.add_1m)
@@ -323,7 +563,7 @@ class MainWindow(QMainWindow):
         top.addWidget(self.add_custom)
 
         top.addStretch(1)
-        root_layout.addLayout(top)
+        left_layout.addLayout(top)
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -336,7 +576,97 @@ class MainWindow(QMainWindow):
         self.cards_layout.setVerticalSpacing(14)
 
         self.scroll.setWidget(self.cards_container)
-        root_layout.addWidget(self.scroll)
+        left_layout.addWidget(self.scroll)
+
+        splitter.addWidget(left)
+
+        # Right side: YouTube audio panel
+        right = QWidget()
+        right.setObjectName("MusicPanel")
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(10, 10, 10, 10)
+        right_layout.setSpacing(8)
+
+        input_row = QHBoxLayout()
+        self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText("Paste YouTube URL...")
+        input_row.addWidget(self.url_input)
+
+        self.add_url_button = QPushButton("Add")
+        self.add_url_button.clicked.connect(self.handle_add_url)
+        input_row.addWidget(self.add_url_button)
+        right_layout.addLayout(input_row)
+
+        self.stack_list = QListWidget()
+        self.stack_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+        self.stack_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.stack_list.itemDoubleClicked.connect(self.play_selected_item)
+        right_layout.addWidget(self.stack_list, 1)
+
+        queue_buttons = QHBoxLayout()
+        self.remove_button = QPushButton("Remove")
+        self.remove_button.clicked.connect(self.remove_selected_item)
+        queue_buttons.addWidget(self.remove_button)
+
+        self.up_button = QPushButton("Up")
+        self.up_button.clicked.connect(lambda: self.move_selected_item(-1))
+        queue_buttons.addWidget(self.up_button)
+
+        self.down_button = QPushButton("Down")
+        self.down_button.clicked.connect(lambda: self.move_selected_item(1))
+        queue_buttons.addWidget(self.down_button)
+        right_layout.addLayout(queue_buttons)
+
+        player_buttons = QHBoxLayout()
+        self.prev_button = QPushButton("Prev")
+        self.prev_button.clicked.connect(self.play_previous)
+        player_buttons.addWidget(self.prev_button)
+
+        self.play_pause_button = QPushButton("Play")
+        self.play_pause_button.clicked.connect(self.toggle_play_pause)
+        player_buttons.addWidget(self.play_pause_button)
+
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.clicked.connect(self.stop_playback)
+        player_buttons.addWidget(self.stop_button)
+
+        self.next_button = QPushButton("Next")
+        self.next_button.clicked.connect(self.play_next)
+        player_buttons.addWidget(self.next_button)
+        right_layout.addLayout(player_buttons)
+
+        self.now_playing_label = QLabel("Now playing: (none)")
+        self.now_playing_label.setWordWrap(True)
+        right_layout.addWidget(self.now_playing_label)
+
+        progress_row = QHBoxLayout()
+        self.progress_label = QLabel("00:00 / 00:00")
+        self.progress_label.setMinimumWidth(110)
+        progress_row.addWidget(self.progress_label)
+
+        self.progress_slider = QSlider(Qt.Orientation.Horizontal)
+        self.progress_slider.setRange(0, 1000)
+        self.progress_slider.sliderPressed.connect(self.on_progress_slider_pressed)
+        self.progress_slider.sliderReleased.connect(self.on_progress_slider_released)
+        progress_row.addWidget(self.progress_slider, 1)
+        right_layout.addLayout(progress_row)
+
+        volume_row = QHBoxLayout()
+        volume_row.addWidget(QLabel("Volume"))
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(80)
+        self.volume_slider.valueChanged.connect(self.on_volume_changed)
+        volume_row.addWidget(self.volume_slider, 1)
+        right_layout.addLayout(volume_row)
+
+        self.music_status = QLabel("Ready.")
+        self.music_status.setWordWrap(True)
+        right_layout.addWidget(self.music_status)
+
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
 
         self.setCentralWidget(root)
         self.apply_styles()
@@ -358,7 +688,7 @@ class MainWindow(QMainWindow):
             QPushButton:hover {
                 background: #343843;
             }
-            QLineEdit, QSpinBox {
+            QLineEdit, QSpinBox, QListWidget {
                 background: #2a2d36;
                 border: 1px solid #3a3e47;
                 border-radius: 8px;
@@ -377,19 +707,24 @@ class MainWindow(QMainWindow):
             QFrame#TimerCard QPushButton:hover {
                 background: #444852;
             }
+            QWidget#MusicPanel {
+                background: #252830;
+                border: 1px solid #3a3e47;
+                border-radius: 10px;
+            }
             """
         )
 
-        # Accent buttons in cards
         for card in self.cards.values():
             card.play_pause_button.setStyleSheet(
-                "background:#f27f62; border:1px solid #f27f62; color:#101316; border-radius:18px;"
+                "background:#f27f62; border:1px solid #f27f62; color:#101316; border-radius:8px;"
             )
 
     def resizeEvent(self, event: Any) -> None:  # noqa: N802
         super().resizeEvent(event)
         self.relayout_cards()
 
+    # ----- Timer dashboard -----
     def add_custom_timer(self) -> None:
         total = int(self.custom_h.value()) * 3600 + int(self.custom_m.value()) * 60 + int(self.custom_s.value())
         if total <= 0:
@@ -419,12 +754,12 @@ class MainWindow(QMainWindow):
             remaining_seconds=max(0, int(remaining_seconds if remaining_seconds is not None else total_seconds)),
             is_running=bool(is_running),
         )
+
         card = TimerCard(snapshot)
         card.changed.connect(self.queue_save)
         card.delete_requested.connect(self.delete_timer_card)
-
         card.play_pause_button.setStyleSheet(
-            "background:#f27f62; border:1px solid #f27f62; color:#101316; border-radius:18px;"
+            "background:#f27f62; border:1px solid #f27f62; color:#101316; border-radius:8px;"
         )
 
         self.cards[timer_id] = card
@@ -474,6 +809,266 @@ class MainWindow(QMainWindow):
         self.cards_layout.setColumnStretch(cols, 1)
         self.cards_layout.setRowStretch(row + 1, 1)
 
+    # ----- YouTube audio -----
+    def _set_music_status(self, message: str) -> None:
+        self.music_status.setText(message)
+
+    def _set_music_controls_enabled(self, enabled: bool) -> None:
+        controls = [
+            self.add_url_button,
+            self.remove_button,
+            self.up_button,
+            self.down_button,
+            self.prev_button,
+            self.play_pause_button,
+            self.stop_button,
+            self.next_button,
+            self.progress_slider,
+            self.volume_slider,
+        ]
+        for control in controls:
+            control.setEnabled(enabled)
+
+    def _init_audio_player(self) -> None:
+        if QMediaPlayer is None or QAudioOutput is None:
+            self._set_music_controls_enabled(False)
+            self._set_music_status("Audio backend unavailable in this PySide6 build.")
+            return
+
+        self.audio_output = QAudioOutput(self)
+        self.audio_output.setVolume(self.volume_slider.value() / 100.0)
+
+        self.media_player = QMediaPlayer(self)
+        self.media_player.setAudioOutput(self.audio_output)
+        self.media_player.mediaStatusChanged.connect(self._on_media_status_changed)
+        self.media_player.errorOccurred.connect(self._on_media_error)
+
+        self._set_music_status("Ready.")
+
+    def _on_media_error(self, _error: Any, error_string: str) -> None:
+        if error_string:
+            self._set_music_status(f"Playback error: {error_string}")
+
+    def _on_media_status_changed(self, status: Any) -> None:
+        if QMediaPlayer is None:
+            return
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            self.play_next(auto_triggered=True)
+
+    def handle_add_url(self) -> None:
+        if yt_dlp is None:
+            self._set_music_status("yt-dlp not installed. Run: uv add yt-dlp")
+            return
+
+        url = self.url_input.text().strip()
+        if not url:
+            self._set_music_status("Paste a YouTube URL.")
+            return
+        if not is_valid_youtube_url(url):
+            self._set_music_status("Invalid YouTube URL.")
+            return
+
+        worker = YtDownloadWorker(url=url, cache_dir=self.cache_dir)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+
+        worker.progress.connect(self._set_music_status)
+        worker.finished.connect(self.on_download_finished)
+        worker.error.connect(self.on_download_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        thread.started.connect(worker.run)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda: self._cleanup_worker_thread(worker, thread))
+
+        self.active_workers.append(worker)
+        self.active_threads.append(thread)
+
+        self._set_music_status("Fetching metadata/download...")
+        thread.start()
+
+    def _cleanup_worker_thread(self, worker: YtDownloadWorker, thread: QThread) -> None:
+        if worker in self.active_workers:
+            self.active_workers.remove(worker)
+        if thread in self.active_threads:
+            self.active_threads.remove(thread)
+
+    def on_download_finished(self, entry: QueueEntry) -> None:
+        item = QListWidgetItem(entry.display_text())
+        item.setData(Qt.ItemDataRole.UserRole, entry)
+        self.stack_list.addItem(item)
+        self.url_input.clear()
+        self._set_music_status(f"Added: {entry.title}")
+
+        if self.stack_list.count() == 1:
+            self.stack_list.setCurrentRow(0)
+
+    def on_download_error(self, message: str) -> None:
+        self._set_music_status(f"Error: {message}")
+
+    def selected_or_first_row(self) -> int:
+        row = self.stack_list.currentRow()
+        if row < 0 and self.stack_list.count() > 0:
+            return 0
+        return row
+
+    def find_current_row(self) -> int:
+        if self.current_queue_id:
+            for row in range(self.stack_list.count()):
+                item = self.stack_list.item(row)
+                entry = item.data(Qt.ItemDataRole.UserRole)
+                if isinstance(entry, QueueEntry) and entry.queue_id == self.current_queue_id:
+                    return row
+        return self.selected_or_first_row()
+
+    def play_selected_item(self, *_args: Any) -> None:
+        self.play_row(self.selected_or_first_row())
+
+    def play_row(self, row: int) -> None:
+        if self.media_player is None:
+            self._set_music_status("Audio player unavailable.")
+            return
+        if row < 0 or row >= self.stack_list.count():
+            self._set_music_status("Select an item to play.")
+            return
+
+        item = self.stack_list.item(row)
+        entry = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(entry, QueueEntry):
+            self._set_music_status("Invalid queue entry.")
+            return
+
+        file_path = Path(entry.file_path)
+        if not file_path.exists():
+            self._set_music_status("Cached file missing. Remove and add URL again.")
+            return
+
+        self.media_player.setSource(QUrl.fromLocalFile(str(file_path)))
+        self.media_player.play()
+
+        self.current_queue_id = entry.queue_id
+        self.stack_list.setCurrentRow(row)
+        self.play_pause_button.setText("Pause")
+        self.now_playing_label.setText(f"Now playing: {entry.title}")
+        self._set_music_status(f"Playing: {entry.title}")
+
+    def toggle_play_pause(self) -> None:
+        if self.media_player is None or QMediaPlayer is None:
+            self._set_music_status("Audio player unavailable.")
+            return
+
+        state = self.media_player.playbackState()
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            self.media_player.pause()
+            self.play_pause_button.setText("Play")
+            return
+
+        if self.current_queue_id is None:
+            self.play_selected_item()
+        else:
+            self.media_player.play()
+            self.play_pause_button.setText("Pause")
+
+    def stop_playback(self) -> None:
+        if self.media_player is None:
+            return
+        self.media_player.stop()
+        self.play_pause_button.setText("Play")
+        self.progress_slider.setValue(0)
+        self.progress_label.setText("00:00 / 00:00")
+        self.now_playing_label.setText("Now playing: (none)")
+        self.current_queue_id = None
+        self._set_music_status("Stopped.")
+
+    def play_next(self, auto_triggered: bool = False) -> None:
+        current_row = self.find_current_row()
+        if current_row < 0:
+            self._set_music_status("Queue is empty.")
+            return
+
+        next_row = current_row + 1
+        if next_row >= self.stack_list.count():
+            self.play_pause_button.setText("Play")
+            if auto_triggered:
+                self._set_music_status("Reached end of queue.")
+            return
+
+        self.play_row(next_row)
+
+    def play_previous(self) -> None:
+        current_row = self.find_current_row()
+        if current_row <= 0:
+            self._set_music_status("No previous item.")
+            return
+        self.play_row(current_row - 1)
+
+    def remove_selected_item(self) -> None:
+        row = self.stack_list.currentRow()
+        if row < 0:
+            self._set_music_status("Select an item to remove.")
+            return
+
+        item = self.stack_list.item(row)
+        entry = item.data(Qt.ItemDataRole.UserRole)
+        was_current = isinstance(entry, QueueEntry) and entry.queue_id == self.current_queue_id
+
+        self.stack_list.takeItem(row)
+        if was_current:
+            self.stop_playback()
+        self._set_music_status("Removed item.")
+
+    def move_selected_item(self, direction: int) -> None:
+        row = self.stack_list.currentRow()
+        if row < 0:
+            self._set_music_status("Select an item to reorder.")
+            return
+
+        new_row = row + direction
+        if new_row < 0 or new_row >= self.stack_list.count():
+            return
+
+        item = self.stack_list.takeItem(row)
+        self.stack_list.insertItem(new_row, item)
+        self.stack_list.setCurrentRow(new_row)
+        self._set_music_status("Reordered queue.")
+
+    def on_volume_changed(self, value: int) -> None:
+        if self.audio_output is not None:
+            self.audio_output.setVolume(value / 100.0)
+
+    def on_progress_slider_pressed(self) -> None:
+        self.is_user_seeking = True
+
+    def on_progress_slider_released(self) -> None:
+        self.is_user_seeking = False
+        if self.media_player is None:
+            return
+
+        duration = self.media_player.duration()
+        if duration and duration > 0:
+            new_position = int((self.progress_slider.value() / 1000.0) * duration)
+            self.media_player.setPosition(new_position)
+
+    def update_playback_progress(self) -> None:
+        if self.media_player is None:
+            return
+
+        duration = self.media_player.duration()
+        position = self.media_player.position()
+        if duration and duration > 0 and position >= 0:
+            if not self.is_user_seeking:
+                value = int((position / duration) * 1000)
+                self.progress_slider.blockSignals(True)
+                self.progress_slider.setValue(max(0, min(1000, value)))
+                self.progress_slider.blockSignals(False)
+
+            elapsed = format_duration_short(int(position / 1000))
+            total = format_duration_short(int(duration / 1000))
+            self.progress_label.setText(f"{elapsed} / {total}")
+
+    # ----- Persistence -----
     def queue_save(self) -> None:
         self.save_timer.start()
 
@@ -522,15 +1117,23 @@ class MainWindow(QMainWindow):
                 self.relayout_cards()
                 return
 
-        # Default cards when there is no compatible timer layout.
         self.add_timer_card("1 min", 60, save=False)
         self.add_timer_card("3 min", 180, save=False)
         self.add_timer_card("1 hour", 3600, save=False)
         self.save_layout()
 
+    def closeEvent(self, event: Any) -> None:  # noqa: N802
+        try:
+            self.save_layout()
+            if self.media_player is not None:
+                self.media_player.stop()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
 
 def main() -> int:
-    app = QApplication([])
+    app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
     return app.exec()
