@@ -1,0 +1,25 @@
+{
+  "timers": [
+    {
+      "timer_id": "669b3c26ddc3416e85b407698aa2202a",
+      "title": "1 min",
+      "total_seconds": 3600,
+      "remaining_seconds": 3586,
+      "is_running": true
+    },
+    {
+      "timer_id": "421e336e9c3b4963a5fbfec85495f08d",
+      "title": "3 min",
+      "total_seconds": 180,
+      "remaining_seconds": 180,
+      "is_running": false
+    },
+    {
+      "timer_id": "6cb05d56fdfd4c0c85a751ca2055020d",
+      "title": "1 hour",
+      "total_seconds": 3600,
+      "remaining_seconds": 3600,
+      "is_running": false
+    }
+  ]
+}
